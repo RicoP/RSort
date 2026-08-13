@@ -17,18 +17,19 @@
  *                int (*compare)(const void *, const void *));
  *
  * Unlike qsort, each function here also takes a `swap` callback (called as
- * swap(a, b, size) to exchange two elements) and returns the number of
- * element swaps it performed (matching what the original int-array
- * versions returned). Pass rsort_swap for the default byte-wise swap.
+ * swap(base, ia, ib, size) to exchange the elements at indices ia and ib)
+ * and returns the number of element swaps it performed (matching what the
+ * original int-array versions returned). Pass rsort_swap for the default
+ * byte-wise swap.
  */
 
 static inline void *rsort_elem(void *base, size_t size, size_t idx) {
 	return (unsigned char *)base + idx * size;
 }
 
-static inline void rsort_swap(void *a, void *b, size_t size) {
-	unsigned char *pa = (unsigned char *)a;
-	unsigned char *pb = (unsigned char *)b;
+static inline void rsort_swap(void *base, size_t ia, size_t ib, size_t size) {
+	unsigned char *pa = (unsigned char *)rsort_elem(base, size, ia);
+	unsigned char *pb = (unsigned char *)rsort_elem(base, size, ib);
 	while (size--) {
 		unsigned char tmp = *pa;
 		*pa = *pb;
@@ -40,7 +41,7 @@ static inline void rsort_swap(void *a, void *b, size_t size) {
 
 static inline size_t rsort2(void *base, size_t nmemb, size_t size,
 		int (*compare)(const void *, const void *),
-		void (*swap)(void *a, void *b, size_t size)) {
+		void (*swap)(void *base, size_t ia, size_t ib, size_t size)) {
 	size_t swaps = 0;
 	size_t p, s, x, n;
 
@@ -69,7 +70,7 @@ static inline size_t rsort2(void *base, size_t nmemb, size_t size,
 	p = s; // ???!!!
 	s++;
 	n--;
-	swap(rsort_elem(base, size, p), rsort_elem(base, size, n), size);
+	swap(base, p, n, size);
 	swaps++;
 	goto the_beginning;
 
@@ -81,7 +82,7 @@ static inline size_t rsort2(void *base, size_t nmemb, size_t size,
 	}
 
 	do_the_swapping:
-	if(p != x - 1) { swap(rsort_elem(base, size, p), rsort_elem(base, size, x - 1), size); swaps++; }
+	if(p != x - 1) { swap(base, p, x - 1, size); swaps++; }
 	n--;
 	// ??? if(p != s && arr[p] < arr[s]) swap(p, s) ???
 	if(s == n) { goto the_beginning; }
@@ -90,7 +91,7 @@ static inline size_t rsort2(void *base, size_t nmemb, size_t size,
 
 static inline size_t rsort2_ver2(void *base, size_t nmemb, size_t size,
 		int (*compare)(const void *, const void *),
-		void (*swap)(void *a, void *b, size_t size)) {
+		void (*swap)(void *base, size_t ia, size_t ib, size_t size)) {
 	size_t swaps = 0;
 	size_t p, s, x, n;
 
@@ -116,7 +117,7 @@ static inline size_t rsort2_ver2(void *base, size_t nmemb, size_t size,
 	p = s; // ???!!!
 	s++;
 	n--;
-	swap(rsort_elem(base, size, p), rsort_elem(base, size, n), size);
+	swap(base, p, n, size);
 	swaps++;
 	goto the_beginning;
 
@@ -128,7 +129,7 @@ static inline size_t rsort2_ver2(void *base, size_t nmemb, size_t size,
 	}
 
 	do_the_swapping:
-	if(p != x - 1) { swap(rsort_elem(base, size, p), rsort_elem(base, size, x - 1), size); swaps++; }
+	if(p != x - 1) { swap(base, p, x - 1, size); swaps++; }
 	n--;
 	// ??? if(p != s && arr[p] < arr[s]) swap(p, s) ???
 	if(s == n) { goto the_beginning; }

@@ -1,24 +1,26 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include <assert.h>
 #include <unistd.h>
 #include <fcntl.h>
 
-#include "rsort.h"
+#include "sortalgos.h"
 
 typedef size_t (*sort_fp)(void *base, size_t nmemb, size_t size,
 	int (*compare)(const void *, const void *),
-	void (*swap)(void *a, void *b, size_t size));
+	void (*swap)(void *base, size_t ia, size_t ib, size_t size));
 
 int cmp_int(const void * a, const void * b) {
 	int ia = *(const int *)a, ib = *(const int *)b;
 	return (ia > ib) - (ia < ib);
 }
 
-void int_swap(void * a, void * b, size_t size) {
-	printf("[swap %d,%d]", *(int *)a, *(int *)b);
-	rsort_swap(a, b, size);
+void int_swap(void * base, size_t ia, size_t ib, size_t size) {
+	printf("[swap %d,%d]", *(int *)rsort_elem(base, size, ia), *(int *)rsort_elem(base, size, ib));
+	rsort_swap(base, ia, ib, size);
 }
 
 bool check_sorted(int * arr, int N) {
@@ -244,6 +246,51 @@ void run_all_tests(sort_fp sorter, const char * name) {
 	run_stress_test(sorter, name, 1337, 500, 300, 1000000);   // large value range: mostly-unique values, bigger N
 }
 
+typedef struct {
+	sort_fp fn;
+	const char * name;
+} sorter_entry;
+
+static const sorter_entry all_sorters[] = {
+	{ rsort2,         "rsort2" },
+	{ rsort2_ver2,    "rsort2_ver2" },
+	{ quicksort,      "quicksort" },
+	{ insertion_sort, "insertion_sort" },
+};
+#define NUM_SORTERS (sizeof(all_sorters) / sizeof(all_sorters[0]))
+
+// Runtime comparison on large, uniform-random arrays. Uses rsort_swap
+// (silent) rather than int_swap: int_swap's printf-per-swap would both
+// flood stdout and dominate the measured time, making the comparison
+// meaningless.
+void run_runtime_comparison(void) {
+	int sizes[] = { 1000, 5000, 20000 };
+
+	printf("\nRuntime comparison (uniform random ints, CPU time):\n");
+	for(size_t si = 0; si < sizeof(sizes) / sizeof(sizes[0]); ++si) {
+		int N = sizes[si];
+
+		srand(4242);
+		int * master = malloc(sizeof(int) * N);
+		for(int i = 0; i < N; ++i) master[i] = rand();
+
+		int * arr = malloc(sizeof(int) * N);
+		for(size_t k = 0; k < NUM_SORTERS; ++k) {
+			memcpy(arr, master, sizeof(int) * N);
+			clock_t t0 = clock();
+			size_t swaps = all_sorters[k].fn(arr, (size_t)N, sizeof(int), cmp_int, rsort_swap);
+			clock_t t1 = clock();
+			assert(check_sorted(arr, N));
+			printf("  N=%-7d %-15s %8.4fs  (%zu swaps)\n",
+				N, all_sorters[k].name, (double)(t1 - t0) / CLOCKS_PER_SEC, swaps);
+		}
+
+		free(arr);
+		free(master);
+		printf("  ---\n");
+	}
+}
+
 int main() {
 	// rsort1 has no generic counterpart in rsort.h: its recursion blows up
 	// exponentially with N, so it was intentionally left out of the header.
@@ -255,5 +302,15 @@ int main() {
 	printf("Sort 2 ver 2\n");
 	run_all_tests(rsort2_ver2, "Sort2ver2");
 
+	printf("------------------------\n");
+	printf("Quicksort\n");
+	run_all_tests(quicksort, "Quicksort");
+
+	printf("------------------------\n");
+	printf("Insertion sort\n");
+	run_all_tests(insertion_sort, "InsertionSort");
+
 	printf("\nOK!\n");
+
+	run_runtime_comparison();
 }
