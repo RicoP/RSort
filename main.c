@@ -259,10 +259,50 @@ static const sorter_entry all_sorters[] = {
 };
 #define NUM_SORTERS (sizeof(all_sorters) / sizeof(all_sorters[0]))
 
-// Runtime comparison on large, uniform-random arrays. Uses rsort_swap
-// (silent) rather than int_swap: int_swap's printf-per-swap would both
-// flood stdout and dominate the measured time, making the comparison
-// meaningless.
+bool check_sorted_generic(void * base, size_t nmemb, size_t size, int (*compare)(const void *, const void *)) {
+	for(size_t i = 1; i < nmemb; ++i) {
+		if(compare(rsort_elem(base, size, i), rsort_elem(base, size, i - 1)) < 0) return false;
+	}
+
+	return true;
+}
+
+// Comparison counter, wired in transparently by run_size_comparison so every
+// benchmark reports comparisons alongside swaps — needed to tell whether
+// runtime is actually swap-bound or comparison-bound.
+static long long g_compare_count;
+static int (*g_inner_compare)(const void *, const void *);
+
+int counting_compare(const void * a, const void * b) {
+	++g_compare_count;
+	return g_inner_compare(a, b);
+}
+
+// Runs every sorter over the same `master` data (element type erased to
+// void*/size/compare), timing each with rsort_swap (silent) rather than
+// int_swap: a printf-per-swap would both flood stdout and dominate the
+// measured time, making the comparison meaningless.
+void run_size_comparison(void * master, size_t nmemb, size_t size,
+		int (*compare)(const void *, const void *), const char * label) {
+	void * arr = malloc(size * nmemb);
+
+	printf("  %s (element size=%zu, N=%zu):\n", label, size, nmemb);
+	for(size_t k = 0; k < NUM_SORTERS; ++k) {
+		memcpy(arr, master, size * nmemb);
+		g_inner_compare = compare;
+		g_compare_count = 0;
+		clock_t t0 = clock();
+		size_t swaps = all_sorters[k].fn(arr, nmemb, size, counting_compare, rsort_swap);
+		clock_t t1 = clock();
+		assert(check_sorted_generic(arr, nmemb, size, compare));
+		printf("    %-15s %8.4fs  (%zu swaps, %lld compares)\n",
+			all_sorters[k].name, (double)(t1 - t0) / CLOCKS_PER_SEC, swaps, g_compare_count);
+	}
+
+	free(arr);
+}
+
+// Runtime comparison on large, uniform-random int arrays.
 void run_runtime_comparison(void) {
 	int sizes[] = { 1000, 5000, 20000 };
 
@@ -274,21 +314,106 @@ void run_runtime_comparison(void) {
 		int * master = malloc(sizeof(int) * N);
 		for(int i = 0; i < N; ++i) master[i] = rand();
 
-		int * arr = malloc(sizeof(int) * N);
-		for(size_t k = 0; k < NUM_SORTERS; ++k) {
-			memcpy(arr, master, sizeof(int) * N);
-			clock_t t0 = clock();
-			size_t swaps = all_sorters[k].fn(arr, (size_t)N, sizeof(int), cmp_int, rsort_swap);
-			clock_t t1 = clock();
-			assert(check_sorted(arr, N));
-			printf("  N=%-7d %-15s %8.4fs  (%zu swaps)\n",
-				N, all_sorters[k].name, (double)(t1 - t0) / CLOCKS_PER_SEC, swaps);
-		}
+		run_size_comparison(master, (size_t)N, sizeof(int), cmp_int, "int");
 
-		free(arr);
 		free(master);
-		printf("  ---\n");
 	}
+}
+
+// Comparator that only looks at the first 8 bytes, vs. cmp_recordN below
+// which memcmp's the whole element. Both still SWAP the whole element
+// (rsort_swap always moves `size` bytes) — this pair only varies how much
+// gets read for comparison, to isolate comparison cost from swap cost.
+int cmp_prefix8(const void * a, const void * b) {
+	return memcmp(a, b, 8);
+}
+
+// Runtime comparison on a less trivial type: a struct wrapping a raw char
+// buffer, ordered lexicographically (memcmp) by its bytes. One type +
+// comparator pair is generated per buffer size via macro, since C has no
+// generics and the sort algorithms need `sizeof(RecordN)` to actually equal
+// each requested buffer size (not just a runtime byte count) for the
+// benchmark to reflect real per-swap copy cost at that element size.
+//
+// Byte counts must be given as a single literal (not a `512 * 1024`
+// expression): DEFINE_RECORD_TYPE pastes its argument onto `Record` via
+// `##`, which only pastes with the first token of a multi-token argument.
+#define DEFINE_RECORD_TYPE(N) \
+	typedef struct { unsigned char buf[N]; } Record##N; \
+	int cmp_record##N(const void * a, const void * b) { \
+		return memcmp(a, b, sizeof(Record##N)); \
+	} \
+	void bench_record##N(size_t nmemb) { \
+		Record##N * master = malloc(sizeof(Record##N) * nmemb); \
+		srand(4242); \
+		for(size_t i = 0; i < nmemb; ++i) { \
+			for(size_t b = 0; b < sizeof(Record##N); ++b) master[i].buf[b] = (unsigned char)rand(); \
+		} \
+		run_size_comparison(master, nmemb, sizeof(Record##N), cmp_record##N, "struct{char buf[" #N "]} full-compare"); \
+		run_size_comparison(master, nmemb, sizeof(Record##N), cmp_prefix8, "struct{char buf[" #N "]} prefix8-compare"); \
+		free(master); \
+	}
+
+DEFINE_RECORD_TYPE(128)
+DEFINE_RECORD_TYPE(256)
+DEFINE_RECORD_TYPE(512)
+DEFINE_RECORD_TYPE(8192)    // 8KB
+DEFINE_RECORD_TYPE(32768)   // 32KB
+DEFINE_RECORD_TYPE(65536)   // 64KB
+
+void run_record_benchmarks(void) {
+	printf("\nRuntime comparison (struct { char buf[N]; }, full-buffer vs first-8-bytes compare):\n");
+	bench_record128(200);
+	bench_record256(200);
+	bench_record512(200);
+	bench_record8192(200);
+	bench_record32768(200);
+	bench_record65536(200);
+}
+
+// Worst case for memcmp: every element shares the same (N-8)-byte prefix,
+// differing only in its last 8 bytes. A full-buffer memcmp can no longer
+// short-circuit early — it has to scan the entire shared prefix before
+// reaching the bytes that actually differ — while a comparator that reads
+// straight from the last 8 bytes finds the same answer immediately. Both
+// comparators agree on order (the true key lives in those last 8 bytes),
+// so this is still a fair "same sort, different comparison cost" test —
+// unlike a shared *suffix*, which would make a cheap prefix-only comparator
+// see ties and change what gets sorted.
+#define DEFINE_RECORD_WORST_CASE(N) \
+	int cmp_record##N##_suffix8(const void * a, const void * b) { \
+		return memcmp((const unsigned char *)a + sizeof(Record##N) - 8, \
+		              (const unsigned char *)b + sizeof(Record##N) - 8, 8); \
+	} \
+	void bench_record##N##_sharedprefix(size_t nmemb) { \
+		Record##N * master = malloc(sizeof(Record##N) * nmemb); \
+		unsigned char shared[sizeof(Record##N)]; \
+		srand(1234); \
+		for(size_t b = 0; b < sizeof(Record##N); ++b) shared[b] = (unsigned char)rand(); \
+		for(size_t i = 0; i < nmemb; ++i) { \
+			memcpy(master[i].buf, shared, sizeof(Record##N)); \
+			for(size_t b = sizeof(Record##N) - 8; b < sizeof(Record##N); ++b) master[i].buf[b] = (unsigned char)rand(); \
+		} \
+		run_size_comparison(master, nmemb, sizeof(Record##N), cmp_record##N, "struct{char buf[" #N "]} SHARED-PREFIX full-compare"); \
+		run_size_comparison(master, nmemb, sizeof(Record##N), cmp_record##N##_suffix8, "struct{char buf[" #N "]} SHARED-PREFIX suffix8-compare"); \
+		free(master); \
+	}
+
+DEFINE_RECORD_WORST_CASE(128)
+DEFINE_RECORD_WORST_CASE(256)
+DEFINE_RECORD_WORST_CASE(512)
+DEFINE_RECORD_WORST_CASE(8192)
+DEFINE_RECORD_WORST_CASE(32768)
+DEFINE_RECORD_WORST_CASE(65536)
+
+void run_shared_prefix_benchmarks(void) {
+	printf("\nRuntime comparison (struct { char buf[N]; }, SHARED PREFIX -- memcmp worst case):\n");
+	bench_record128_sharedprefix(200);
+	bench_record256_sharedprefix(200);
+	bench_record512_sharedprefix(200);
+	bench_record8192_sharedprefix(200);
+	bench_record32768_sharedprefix(200);
+	bench_record65536_sharedprefix(200);
 }
 
 int main() {
@@ -313,4 +438,6 @@ int main() {
 	printf("\nOK!\n");
 
 	run_runtime_comparison();
+	run_record_benchmarks();
+	run_shared_prefix_benchmarks();
 }
